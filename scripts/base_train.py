@@ -62,8 +62,7 @@ parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
-parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
-parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
+parser.add_argument("--warmup-steps", type=int, default=700, help="number of LR warmup steps")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
@@ -319,17 +318,14 @@ x, y, dataloader_state_dict = next(train_loader) # kick off load of the very fir
 # -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
 
-# Learning rate scheduler
+# Learning rate scheduler: warmup then linear decay
 def get_lr_multiplier(it):
-    warmup_iters = round(args.warmup_ratio * num_iterations)
-    warmdown_iters = round(args.warmdown_ratio * num_iterations)
+    warmup_iters = args.warmup_steps
     if it < warmup_iters:
         return (it + 1) / warmup_iters
-    elif it <= num_iterations - warmdown_iters:
-        return 1.0
     else:
-        progress = (num_iterations - it) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * args.final_lr_frac
+        progress = (it - warmup_iters) / max(1, num_iterations - warmup_iters)
+        return 1.0 + (args.final_lr_frac - 1.0) * progress
 
 # Momentum scheduler for Muon optimizer
 def get_muon_momentum(it):
@@ -543,8 +539,7 @@ get_report().log(section="Base model training", data=[
         "Number of training tokens": total_tokens,
         "Tokens : Scaling params ratio": args.total_batch_size * num_iterations / num_scaling_params,
         "DDP world size": ddp_world_size,
-        "warmup_ratio": args.warmup_ratio,
-        "warmdown_ratio": args.warmdown_ratio,
+        "warmup_steps": args.warmup_steps,
         "final_lr_frac": args.final_lr_frac,
     },
     { # stats about training outcomes
