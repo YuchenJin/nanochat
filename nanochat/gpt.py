@@ -37,6 +37,8 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Smoothly cap logits to [-logit_softcap, logit_softcap]. Set <=0 to disable.
+    logit_softcap: float = 15.0
 
 
 def norm(x):
@@ -406,21 +408,31 @@ class GPT(nn.Module):
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
-        # Forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        # Forward lm_head and loss.
+        softcap = self.config.logit_softcap
+        vocab_size = self.config.vocab_size
+
+        def maybe_softcap(logits):
+            if softcap <= 0:
+                return logits
+            logits = logits.float()
+            return softcap * torch.tanh(logits / softcap)
+
+        logits = self.lm_head(x) # (B, T, padded_vocab_size)
+        logits = logits[..., :vocab_size] # slice to remove padding
+        logits = maybe_softcap(logits)
 
         if targets is not None:
             # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                ignore_index=-1,
+                reduction=loss_reduction,
+            )
             return loss
-        else:
-            # inference: just return the logits directly
-            return logits
+        # inference: keep logits in float32 for stable sampling
+        return logits.float()
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

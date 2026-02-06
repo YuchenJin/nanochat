@@ -249,9 +249,18 @@ class MuonAdamW(torch.optim.Optimizer):
         second_momentum_buffer = state["second_momentum_buffer"]
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
-        # Stack grads and params (NOTE: this assumes all params have the same shape)
-        stacked_grads = torch.stack([p.grad for p in params])
-        stacked_params = torch.stack(params)
+        # Reuse dense staging buffers to avoid per-step torch.stack allocations
+        if "stacked_grads" not in state:
+            state["stacked_grads"] = torch.empty((num_params, *shape), dtype=dtype, device=device)
+            state["stacked_params"] = torch.empty((num_params, *shape), dtype=dtype, device=device)
+            state["stacked_grad_views"] = list(state["stacked_grads"].unbind(0))
+            state["stacked_param_views"] = list(state["stacked_params"].unbind(0))
+        stacked_grads = state["stacked_grads"]
+        stacked_params = state["stacked_params"]
+        stacked_grad_views = state["stacked_grad_views"]
+        stacked_param_views = state["stacked_param_views"]
+        torch._foreach_copy_(stacked_grad_views, [p.grad for p in params])
+        torch._foreach_copy_(stacked_param_views, params)
 
         # Fill all the 0-D tensors with current values
         self._muon_momentum_t.fill_(group["momentum"])
@@ -274,7 +283,7 @@ class MuonAdamW(torch.optim.Optimizer):
         )
 
         # Copy back to original params
-        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+        torch._foreach_copy_(params, stacked_param_views)
 
     @torch.no_grad()
     def step(self):
@@ -386,16 +395,23 @@ class DistMuonAdamW(torch.optim.Optimizer):
         padded_num_params = chunk_size * world_size
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
+        state = self.state[p]
 
-        # Stack grads and zero-pad to padded_num_params
-        grad_stack = torch.stack([p.grad for p in params])
-        stacked_grads = torch.empty(padded_num_params, *shape, dtype=dtype, device=device)
-        stacked_grads[:len(params)].copy_(grad_stack)
+        # Reuse communication buffers instead of allocating per step
+        if "stacked_grads" not in state:
+            state["stacked_grads"] = torch.empty((padded_num_params, *shape), dtype=dtype, device=device)
+            state["grad_chunk"] = torch.empty((chunk_size, *shape), dtype=dtype, device=device)
+            state["stacked_grad_views"] = list(state["stacked_grads"].unbind(0))
+            state["updated_params"] = torch.empty((chunk_size, *shape), dtype=dtype, device=device)
+            state["updated_param_views"] = list(state["updated_params"].unbind(0))
+        stacked_grads = state["stacked_grads"]
+        grad_chunk = state["grad_chunk"]
+        stacked_grad_views = state["stacked_grad_views"]
+        torch._foreach_copy_(stacked_grad_views[:len(params)], [p.grad for p in params])
         if len(params) < padded_num_params:
             stacked_grads[len(params):].zero_()
 
         # Reduce_scatter to get this rank's chunk
-        grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
         future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
 
         return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
@@ -463,12 +479,14 @@ class DistMuonAdamW(torch.optim.Optimizer):
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
-        # Build output buffer for all_gather
-        updated_params = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+        # Reuse output buffer for all_gather
+        updated_params = state["updated_params"]
+        updated_param_views = state["updated_param_views"]
 
         if num_owned > 0:
             owned_params = [params[start_idx + i] for i in range(num_owned)]
-            stacked_owned = torch.stack(owned_params)
+            torch._foreach_copy_(updated_param_views[:num_owned], owned_params)
+            stacked_owned = updated_params[:num_owned]
 
             # Fill 0-D tensors and run fused kernel
             self._muon_momentum_t.fill_(group["momentum"])
@@ -481,7 +499,6 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
                 group["ns_steps"], red_dim,
             )
-            updated_params[:num_owned].copy_(stacked_owned)
 
         if num_owned < chunk_size:
             updated_params[num_owned:].zero_()

@@ -22,10 +22,22 @@ def log0(message):
 
 def _patch_missing_config_keys(model_config_kwargs):
     """Add default values for new config keys missing in old checkpoints."""
+    # Remove stale experimental keys that are no longer part of GPTConfig.
+    # This keeps loading checkpoints created by temporary local experiments.
+    if "loss_chunk_size" in model_config_kwargs:
+        model_config_kwargs.pop("loss_chunk_size")
+        log0(f"Dropping stale loss_chunk_size from model config")
+    if "activation_checkpointing" in model_config_kwargs:
+        model_config_kwargs.pop("activation_checkpointing")
+        log0(f"Dropping stale activation_checkpointing from model config")
+
     # Old models were trained with full context (no sliding window)
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    if "logit_softcap" not in model_config_kwargs:
+        model_config_kwargs["logit_softcap"] = 15.0
+        log0(f"Patching missing logit_softcap in model config to 15.0")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
